@@ -87,6 +87,116 @@ Frontend 实时显示 AI 的回复
 
 ---
 
+## 更多调用路径例子
+
+### 例子A：文件上传流程
+
+**小明的操作**：在聊天界面点击"上传PDF"按钮，选择一份研究报告
+
+**发生了什么？**
+
+```
+小明点击"上传PDF"
+    ↓
+Frontend 调用 POST /api/threads/{id}/uploads
+    ↓
+Nginx 转发到 Gateway（8001）
+    ↓
+Gateway 做什么？
+    - 接收文件（multipart/form-data）
+    - 保存到 .deer-flow/threads/{id}/uploads/
+    - 如果是PDF/Word/PPT，调用 markitdown 转文本
+    - 返回文件元数据（文件名、大小、转换后的文本路径）
+    ↓
+下次对话时，UploadsMiddleware 自动注入文件信息到提示
+    ↓
+AI 能看到文件内容并基于它回答
+```
+
+**技术细节**：
+- 上传端点：`POST /api/threads/{thread_id}/uploads`
+- 支持格式：PDF、Word（.doc/.docx）、PPT（.ppt/.pptx）、Excel、图片、文本文件
+- 大文件处理：通过 markitdown 转换为 Markdown 文本，方便 AI 处理
+- 文件存储：每个线程有独立的 uploads 目录，隔离安全
+
+---
+
+### 例子B：获取模型列表
+
+**小明的操作**：打开设置面板，想切换使用的 AI 模型
+
+**发生了什么？**
+
+```
+小明打开设置面板，看到可用模型列表
+    ↓
+Frontend 调用 GET /api/models
+    ↓
+Nginx 转发到 Gateway（8001）
+    ↓
+Gateway 读取 config.yaml 中的 models 配置
+    ↓
+返回模型列表（名称、提供商、是否支持思考模式等）
+    ↓
+Frontend 展示模型选项，小明选择"DeepSeek-V3"
+```
+
+**返回示例**：
+```json
+{
+  "models": [
+    {
+      "name": "gpt-4o",
+      "display_name": "GPT-4o",
+      "supports_thinking": false,
+      "supports_vision": true
+    },
+    {
+      "name": "deepseek-v3",
+      "display_name": "DeepSeek V3",
+      "supports_thinking": true,
+      "supports_vision": false
+    }
+  ]
+}
+```
+
+---
+
+### 例子C：长对话的上下文摘要
+
+**场景**：小明和 AI 已经对话了50轮，讨论一个很复杂的项目
+
+**发生了什么？**
+
+```
+对话进行了50轮，token数超过8000
+    ↓
+SummarizationMiddleware 检测到 token_threshold 触发
+    ↓
+调用轻量级模型（如 gpt-4o-mini）总结前30轮
+    ↓
+将总结插入历史消息，保留最近20轮完整对话
+    ↓
+继续对话，模型看到的是"总结+最近20轮"
+    ↓
+AI 仍然理解完整上下文，但 token 数大幅降低
+```
+
+**配置控制**：
+```yaml
+summarization:
+  enabled: true          # 是否启用自动摘要
+  token_threshold: 8000  # 触发阈值
+  summary_model: "gpt-4o-mini"  # 用于摘要的轻量级模型
+  keep_messages: 20      # 保留最近多少条完整消息
+```
+
+**生活例子**：
+> 就像一位秘书帮你整理会议记录。前30轮讨论变成了"会议纪要"，后面20轮是详细记录。AI 既能把握全局，又知道最近聊了什么。
+
+---
+
 ## 核心组件详解
 
 ### 1. Nginx（门卫）
@@ -117,6 +227,68 @@ location /api/langgraph/ {
 location /api/ {
     proxy_pass http://localhost:8001;
 }
+```
+
+**Nginx 配置细节详解**：
+
+```nginx
+server {
+    listen 2026;
+    server_name localhost;
+
+    # 1. 访问网页 → Frontend (Next.js)
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    # 2. AI 请求 → LangGraph Server
+    # 匹配规则：以 /api/langgraph/ 开头的请求
+    location /api/langgraph/ {
+        proxy_pass http://localhost:2024;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        # SSE 支持：保持长连接
+        proxy_buffering off;
+        proxy_read_timeout 86400;
+    }
+
+    # 3. 其他 API → Gateway API
+    # 匹配规则：以 /api/ 开头，但不匹配上面的 /api/langgraph/
+    location /api/ {
+        proxy_pass http://localhost:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+**location 匹配规则说明**：
+
+1. **精确匹配**：`location = /` 只匹配根路径
+2. **前缀匹配**：`location /api/` 匹配所有以 `/api/` 开头的请求
+3. **正则匹配**：`location ~ \.php$` 使用正则表达式
+4. **优先级**：精确匹配 > 前缀匹配（长路径优先）> 正则匹配
+
+**proxy_pass 转发逻辑**：
+
+```
+请求: /api/langgraph/threads/123/runs
+      ↓
+匹配 location /api/langgraph/
+      ↓
+转发到: http://localhost:2024/threads/123/runs
+        （去掉匹配的 /api/langgraph/ 前缀）
+
+请求: /api/models
+      ↓
+匹配 location /api/
+      ↓
+转发到: http://localhost:8001/models
 ```
 
 ---
@@ -167,6 +339,19 @@ location /api/ {
 | **Tool** | 工具，AI 可以调用的功能 | 专员的技能 |
 | **Sub-agent** | 子代理，专门处理特定任务的 AI | 专业专员 |
 
+**ThreadState 详细字段**：
+
+| 字段 | 类型 | 作用 | 示例值 |
+|------|------|------|--------|
+| messages | list | 消息历史（来自 AgentState） | [{"role": "user", "content": "..."}] |
+| sandbox | dict | 沙箱信息 | {"container_id": "abc123", "sandbox_id": "sandbox-001"} |
+| thread_data | dict | 路径信息 | {"workspace": "/path/to/ws", "uploads": "/path/to/uploads"} |
+| artifacts | list | 产物文件路径 | ["/outputs/report.md", "/outputs/chart.png"] |
+| title | str | 自动生成的对话标题 | "AI趋势研究报告" |
+| todos | list | 计划模式下的待办事项 | [{"id": 1, "content": "搜索资料", "done": false}] |
+| uploaded_files | list | 用户上传文件的元数据 | [{"name": "doc.pdf", "path": "/uploads/doc.pdf"}] |
+| viewed_images | dict | 视觉模型的图像缓存 | {"img1": {"base64": "...", "path": "/uploads/img.jpg"}} |
+
 **Middleware 链（处理流程）**：
 
 当消息到达 LangGraph Server 后，会依次经过这些处理：
@@ -179,6 +364,50 @@ location /api/ {
 6. **TitleMiddleware**：自动生成对话标题
 7. **ViewImageMiddleware**：处理图片输入（视觉模型）
 8. **ClarificationMiddleware**：处理需要用户澄清的情况
+
+**Middleware 执行顺序图**：
+
+```
+请求进入
+  ↓
+ThreadDataMiddleware (before_agent)
+  ↓
+UploadsMiddleware (before_agent)
+  ↓
+SandboxMiddleware (before_agent)
+  ↓
+DanglingToolCallMiddleware (wrap_model_call)
+  ↓
+[可能触发 SummarizationMiddleware]
+  ↓
+模型调用
+  ↓
+[可能触发 TodoMiddleware, TokenUsageMiddleware, TitleMiddleware]
+  ↓
+工具调用
+  ↓
+ToolErrorHandlingMiddleware (wrap_tool_call)
+  ↓
+ClarificationMiddleware (wrap_tool_call)
+  ↓
+MemoryMiddleware (after_agent)
+```
+
+**关键 Middleware 说明**：
+
+| Middleware | 执行时机 | 作用 |
+|------------|----------|------|
+| ThreadDataMiddleware | before_agent | 延迟创建 per-thread 目录结构 |
+| UploadsMiddleware | before_agent | 读取文件元数据并注入到提示 |
+| SandboxMiddleware | before_agent | 确保沙箱容器运行并注入 sandbox_id |
+| DanglingToolCallMiddleware | wrap_model_call | 扫描消息历史查找缺少响应的工具调用 |
+| SummarizationMiddleware | before_agent | token 超过阈值时总结历史消息 |
+| TodoMiddleware | before_model | 计划模式下跟踪任务进度 |
+| TokenUsageMiddleware | after_model | 记录 LLM token 消耗 |
+| TitleMiddleware | after_model | 首次交换后自动生成标题 |
+| MemoryMiddleware | after_agent | 排队对话进行异步记忆更新 |
+| ToolErrorHandlingMiddleware | wrap_tool_call | 捕获异常并转换为错误消息 |
+| ClarificationMiddleware | wrap_tool_call | 拦截 ask_clarification 工具调用 |
 
 ---
 
@@ -218,38 +447,100 @@ location /api/ {
 
 **内容示例**：
 ```yaml
-# 模型配置
+# ==================== 模型配置 ====================
+# 可以配置多个模型，支持不同提供商
 models:
+  # OpenAI 官方模型
   - name: "gpt-4o"
     provider: "openai"
     api_key: "$OPENAI_API_KEY"  # 从环境变量读取
     base_url: "https://api.openai.com/v1"
+    supports_vision: true       # 支持图像识别
+    supports_thinking: false
   
+  # OpenAI 轻量级模型（用于摘要等场景）
+  - name: "gpt-4o-mini"
+    provider: "openai"
+    api_key: "$OPENAI_API_KEY"
+    base_url: "https://api.openai.com/v1"
+    supports_vision: true
+    supports_thinking: false
+  
+  # DeepSeek 模型（支持思考模式）
   - name: "deepseek-chat"
     provider: "openai_compatible"
     api_key: "$DEEPSEEK_API_KEY"
     base_url: "https://api.deepseek.com/v1"
+    supports_vision: false
+    supports_thinking: true     # 支持深度思考
+  
+  # 本地 Ollama 模型
+  - name: "llama3.1"
+    provider: "ollama"
+    base_url: "http://localhost:11434"
+    supports_vision: false
+    supports_thinking: false
 
-# 工具配置
+# ==================== 工具配置 ====================
+# 控制哪些工具可用
+
 tools:
+  # 网络搜索工具
   - name: "tavily_search"
     enabled: true
     config:
       api_key: "$TAVILY_API_KEY"
+      max_results: 5
   
+  # 命令行执行工具
   - name: "bash"
     enabled: true
+    config:
+      allowed_commands: ["ls", "cat", "grep", "python", "pip"]
+  
+  # 代码执行工具（根据现有资料无法确定详细配置）
+  - name: "python"
+    enabled: true
 
-# 沙箱配置
+# ==================== 沙箱配置 ====================
+# 三种模式：local / docker / provisioner
+
 sandbox:
-  type: "local"  # 可选: local, docker, provisioner
-  workspace_dir: "./workspace"
+  # 模式1：本地沙箱（开发环境推荐）
+  type: "local"
+  workspace_dir: "./.deer-flow/threads"
+  
+  # 模式2：Docker 沙箱（更好的隔离性）
+  # type: "docker"
+  # image: "deerflow-sandbox:latest"
+  # memory_limit: "512m"
+  # cpu_limit: "1.0"
+  
+  # 模式3：Provisioner 模式（生产/K8s环境）
+  # type: "provisioner"
+  # provisioner_url: "http://localhost:8002"
 
-# 摘要配置（控制何时自动总结历史消息）
+# ==================== 摘要配置 ====================
+# 控制长对话的自动摘要行为
+
 summarization:
+  enabled: true              # 是否启用
+  token_threshold: 8000      # 触发阈值（token数）
+  summary_model: "gpt-4o-mini"  # 用于摘要的轻量级模型
+  keep_messages: 20          # 保留最近多少条完整消息
+  min_messages_to_summarize: 10  # 至少多少条消息才触发摘要
+
+# ==================== 其他配置 ====================
+
+# 日志配置
+logging:
+  level: "INFO"              # DEBUG / INFO / WARNING / ERROR
+  format: "json"             # json / text
+
+# 内存配置（根据现有资料无法确定详细配置）
+memory:
   enabled: true
-  token_threshold: 8000
-  summary_model: "gpt-4o-mini"
+  max_memories: 100
 ```
 
 **通俗解释**：
@@ -258,6 +549,19 @@ summarization:
 > - 每个模型怎么联系（API 密钥和地址）
 > - 有哪些工具可用（供应商名录）
 > - 沙箱怎么配置（工作环境设置）
+
+**沙箱三种模式对比**：
+
+| 模式 | 适用场景 | 隔离性 | 启动速度 | 资源占用 |
+|------|----------|--------|----------|----------|
+| **local** | 本地开发 | 低（进程级）| 快 | 低 |
+| **docker** | 测试/小规模部署 | 高（容器级）| 中等 | 中等 |
+| **provisioner** | 生产/K8s 集群 | 高（Pod级）| 按需 | 弹性 |
+
+**环境变量替换规则**：
+- 以 `$` 开头的值会从环境变量读取
+- 例如：`$OPENAI_API_KEY` 会读取系统环境变量 `OPENAI_API_KEY`
+- 安全性：避免在配置文件中硬编码敏感信息
 
 ---
 
