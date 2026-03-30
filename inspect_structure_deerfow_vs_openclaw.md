@@ -1,7 +1,8 @@
-# DeerFlow vs OpenClaw 详细技术对比分析
+# DeerFlow vs OpenClaw 详细技术对比分析（已验证版）
 
 > 目标读者：技术人员（需要深入技术实现细节）  
-> 分析时间：2026-03-29
+> 分析时间：2026-03-30  
+> **验证状态**: OpenClaw 内容已逐条验证（来源：docs.openclaw.ai）
 
 ---
 
@@ -11,108 +12,276 @@
 
 | 维度 | DeerFlow | OpenClaw | 技术差异 |
 |------|----------|----------|---------|
-| 架构模式 | Harness/App 严格分层 | Agent/Gateway/Skills | DeerFlow 分层更严格，Harness 可独立发布 |
-| 入口设计 | Nginx 统一入口(2026) | 多入口设计 | DeerFlow 单一端口简化配置 |
-| 服务拆分 | 3服务(Nginx+LangGraph+Gateway+Frontend) | 多服务架构 | DeerFlow 职责更清晰 |
+| 架构模式 | Harness/App 严格分层 | **Gateway + Agent + Skills + Nodes** | DeerFlow 分层更严格，OpenClaw 采用中心化 Gateway 架构 |
+| 入口设计 | Nginx 统一入口(2026) | **Gateway 单一入口 (Port 18789)** | OpenClaw 统一 WebSocket + HTTP 端口 |
+| 服务拆分 | 3服务(Nginx+LangGraph+Gateway+Frontend) | **单一 Gateway 进程** | OpenClaw 架构更集中 |
+| 通信协议 | HTTP REST | **WebSocket + HTTP** | OpenClaw 使用 WebSocket 双向通信 |
 
-**技术实现差异**：
+### 1.2 OpenClaw Gateway 架构（✅ 已验证）
 
-DeerFlow 的 **Harness/App 分离** 是其架构设计的核心原则之一：
+**官方文档来源**: docs.openclaw.ai/concepts/architecture
 
-```python
-# DeerFlow 的分层架构
-# Harness 层 (可发布包)
-packages/harness/deerflow/
-├── agents/          # Agent 编排
-├── sandbox/         # 沙箱系统
-├── models/          # 模型工厂
-└── tools/           # 工具系统
-
-# App 层 (非发布代码)
-app/
-├── gateway/         # FastAPI Gateway
-└── channels/        # IM 集成
+```
+┌─────────────────────────────────────────┐
+│              Gateway                     │
+│  (WebSocket Control Plane + HTTP API)   │
+│  Port: 18789 (default)                  │
+└──────────────┬──────────────────────────┘
+               │
+    ┌──────────┼──────────┬──────────┐
+    ↓          ↓          ↓          ↓
+  Pi Agent   CLI      WebChat    macOS App
+             Web UI   (浏览器)    iOS/Android Nodes
 ```
 
-依赖规则通过 `test_harness_boundary.py` 在 CI 中强制执行：
-- App 可以导入 deerflow
-- deerflow 严禁导入 app
+**核心设计原则**（官方引用）：
+> "A single long‑lived **Gateway** owns all messaging surfaces... Control-plane clients connect to the Gateway over **WebSocket**"
+> — Source: docs.openclaw.ai/concepts/architecture
 
-```python
-# tests/test_harness_boundary.py
-# 确保 harness 层不依赖 app 层
-def test_harness_imports():
-    # 扫描 deerflow 包中的所有 import
-    # 如果发现从 app.* 的导入，测试失败
-    pass
-```
+**技术实现对比**:
 
-OpenClaw 的架构边界相对模糊，Agent 和 Gateway 之间的通信通过内部协议完成，没有严格的物理分层。
+| 特性 | DeerFlow | OpenClaw |
+|------|----------|----------|
+| 协议 | HTTP REST | **WebSocket (ws://127.0.0.1:18789)** |
+| 首帧要求 | - | **必须发送 `connect`** |
+| 消息格式 | JSON | **JSON over WebSocket** |
+| 认证方式 | API Key | **Token 或 Password** |
+| 默认端口 | 多端口 | **单一端口 18789** |
 
-> 参考：~/wego/projects/deer-flow/docs/external/01_architecture_overview.md, ~/wego/projects/deer-flow/docs/external/02_claude_developer_guide.md
+**OpenClaw HTTP API 端点**（已验证）：
+- `GET /v1/models` - OpenAI 兼容
+- `POST /v1/chat/completions` - OpenAI 兼容
+- `POST /v1/responses` - OpenAI 兼容
+- `POST /tools/invoke` - 工具调用
+- `/__openclaw__/canvas/` - Canvas 主机
+- `/__openclaw__/a2ui/` - A2UI 主机
+- `/hooks` - Webhook 端点
+
+> Source: docs.openclaw.ai/gateway
 
 ---
 
-### 2. Agent 框架对比
+## 第二部分：Channel 渠道对比
 
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 底层框架 | LangGraph + LangChain | 自研 + ACP | DeerFlow 基于成熟框架，OpenClaw 更灵活 |
-| 状态管理 | ThreadState 扩展 | Session 状态 | DeerFlow 状态字段更丰富 |
-| 工作流 | LangGraph 图结构 | 线性/分支结构 | DeerFlow 支持复杂工作流 |
+### 2.1 支持的渠道（✅ 已验证）
 
-**技术实现差异**：
+**OpenClaw 官方渠道列表**（来源：docs.openclaw.ai/channels）：
 
-DeerFlow 基于 LangGraph 的 `AgentState` 进行扩展：
+**原生支持渠道**（20+ 种）：
 
-```python
-# DeerFlow 的 ThreadState 定义
-class ThreadState(AgentState):
-    # 继承自 LangGraph AgentState
-    messages: list[BaseMessage]
-    
-    # DeerFlow 扩展字段
-    sandbox: dict             # 沙箱状态
-    thread_data: dict         # 线程数据路径
-    title: str | None         # 自动生成的标题
-    artifacts: list[str]      # 产物文件路径
-    todos: list | None        # 计划模式待办
-    uploaded_files: list[dict]  # 上传文件元数据
-    viewed_images: dict       # 视觉模型图像缓存
-```
+| 渠道 | 技术实现 | 状态 |
+|------|---------|------|
+| WhatsApp | **Baileys** | ✅ 原生 |
+| Telegram | **grammY Bot API** | ✅ 原生 |
+| Discord | **discord.js** | ✅ 原生 |
+| Slack | **Bolt SDK** | ✅ 原生 |
+| Signal | **signal-cli** | ✅ 原生 |
+| iMessage | **BlueBubbles / legacy** | ✅ 原生 |
+| Feishu | **WebSocket** | ✅ 原生 |
+| Google Chat | **HTTP webhook** | ✅ 原生 |
+| IRC | **IRC protocol** | ✅ 原生 |
+| LINE | **Messaging API** | ✅ Plugin |
+| Matrix | **Matrix protocol** | ✅ Plugin |
+| Mattermost | **Bot API + WebSocket** | ✅ Plugin |
+| Microsoft Teams | **Bot Framework** | ✅ Plugin |
+| Nextcloud Talk | **WebSocket** | ✅ Plugin |
+| Nostr | **NIP-04** | ✅ Plugin |
+| Synology Chat | **Webhooks** | ✅ Plugin |
+| Tlon | **Urbit** | ✅ Plugin |
+| Twitch | **IRC** | ✅ Plugin |
+| WebChat | **WebSocket UI** | ✅ 内置 |
+| WeChat | **Tencent iLink** | ✅ Plugin |
+| Zalo | **Bot API** | ✅ Plugin |
+| Zalo Personal | **QR login** | ✅ Plugin |
+| Voice Call | **Plivo/Twilio** | ✅ Plugin |
 
-OpenClaw 使用自研状态管理，通过 `MEMORY.md` 和 `memory/*.md` 进行持久化：
+**DeerFlow 渠道支持**（根据大纲）：
+- 主打 Web 网页端
+- 渠道支持有限
+- 无独立客户端
 
-```python
-# OpenClaw 的状态管理
-# 通过文件系统持久化
-write("memory/2024-01-15.md", content)  # 每日记忆
-write("MEMORY.md", summary)              # 总结记忆
-
-# 语义搜索
-memory_search(query="...")  # 基于向量的语义检索
-```
-
-**关键差异**：
-- DeerFlow 的状态在内存中管理，通过 LangGraph 的 checkpointing 持久化
-- OpenClaw 的状态直接写入文件系统，更透明但性能较低
-- DeerFlow 使用自定义 reducers（`merge_artifacts`, `merge_viewed_images`）处理状态更新
-
-> 参考：~/wego/projects/deer-flow/docs/external/01_architecture_overview.md
+**对比结论**:
+| 维度 | DeerFlow | OpenClaw |
+|------|----------|----------|
+| 渠道数量 | 有限 | **20+ 种** |
+| Web 端 | ✅ 主打 | ✅ Control UI + WebChat |
+| 移动端 | ❌ | **✅ iOS/Android App** |
+| 桌面端 | ❌ | **✅ macOS Menu Bar** |
 
 ---
 
-## 第二部分：Sandbox 详细技术对比（重点）
+## 第三部分：自动化能力对比
 
-### 1. 架构设计对比
+### 3.1 Cron 调度器（✅ 已验证）
 
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 抽象层 | SandboxProvider 接口 | Sandbox 工具 | DeerFlow 抽象更完善 |
-| 实现模式 | Provider 模式 | 直接工具调用 | DeerFlow 支持多实现切换 |
-| 生命周期 | 显式 acquire/release | 隐式管理 | DeerFlow 控制更精细 |
+**OpenClaw Cron 官方文档**（来源：docs.openclaw.ai/automation/cron-jobs）：
 
-**DeerFlow Sandbox 技术实现**：
+> "Cron is the Gateway's built-in scheduler. It persists jobs, wakes the agent at the right time, and can optionally deliver output back to a chat."
+
+**任务类型**（已验证）：
+| 类型 | 描述 | 配置 |
+|------|------|------|
+| `at` | 一次性定时任务 | `schedule.kind: "at"` |
+| `every` | 固定间隔 | `schedule.kind: "every"` |
+| `cron` | Cron 表达式 | `schedule.kind: "cron"` |
+
+**执行模式**（已验证）：
+| 模式 | Session Target | 用途 |
+|------|---------------|------|
+| Main session | `sessionTarget: "main"` | 下次心跳运行 |
+| Isolated | `sessionTarget: "isolated"` | 独立会话运行 |
+| Current session | `sessionTarget: "current"` | 绑定当前会话 |
+| Custom session | `sessionTarget: "session:xxx"` | 持久命名会话 |
+
+**存储位置**（已验证）：
+> "Job store: `~/.openclaw/cron/jobs.json`"
+> — Source: docs.openclaw.ai/automation/cron-jobs
+
+**DeerFlow 自动化现状**（根据大纲）：
+- ❌ 暂无定时任务
+- ❌ 暂无 hook 触发器
+- ❌ 被动式架构
+
+### 3.2 Webhook 触发器（✅ 已验证）
+
+**OpenClaw Webhook 官方文档**（来源：docs.openclaw.ai/automation/webhook）：
+
+**端点**（已验证）：
+| 端点 | 方法 | 功能 |
+|------|------|------|
+| `/hooks/wake` | POST | 触发系统事件 |
+| `/hooks/agent` | POST | 运行独立 Agent |
+| `/hooks/<name>` | POST | 自定义映射 |
+
+**配置示例**（官方）：
+```json5
+{
+  hooks: {
+    enabled: true,
+    token: "shared-secret",
+    path: "/hooks",
+    mappings: [
+      { match: { path: "gmail" }, action: "agent", deliver: true }
+    ]
+  }
+}
+```
+
+### 3.3 Heartbeat 机制（✅ 已验证）
+
+**官方文档**（来源：docs.openclaw.ai/gateway/heartbeat）：
+
+```json5
+{
+  agents: {
+    defaults: {
+      heartbeat: {
+        every: "30m",
+        target: "last"
+      }
+    }
+  }
+}
+```
+
+**对比结论**:
+| 维度 | DeerFlow | OpenClaw |
+|------|----------|----------|
+| 定时任务 | ❌ 暂无 | **✅ 内置 Cron** |
+| Webhook | ❌ 暂无 | **✅ 支持** |
+| Heartbeat | ❌ 暂无 | **✅ 支持** |
+| 触发器 | ❌ 被动式 | **✅ 主动式** |
+
+---
+
+## 第四部分：Agent / Sub-Agent 架构对比
+
+### 4.1 Multi-Agent 支持（✅ 已验证）
+
+**OpenClaw 官方文档**（来源：docs.openclaw.ai/concepts/multi-agent）：
+
+> "An **agent** is a fully scoped brain with its own: **Workspace**, **State directory** (`agentDir`), **Session store**"
+
+**隔离维度**（已验证）：
+| 维度 | 路径 |
+|------|------|
+| Workspace | `~/.openclaw/workspace-<agentId>` |
+| Agent Dir | `~/.openclaw/agents/<agentId>/agent` |
+| Sessions | `~/.openclaw/agents/<agentId>/sessions` |
+| Auth | `~/.openclaw/agents/<agentId>/agent/auth-profiles.json` |
+
+**配置示例**（官方）：
+```json5
+{
+  agents: {
+    list: [
+      { id: "home", workspace: "~/.openclaw/workspace-home" },
+      { id: "work", workspace: "~/.openclaw/workspace-work" }
+    ]
+  },
+  bindings: [
+    { agentId: "home", match: { channel: "whatsapp", accountId: "personal" } },
+    { agentId: "work", match: { channel: "whatsapp", accountId: "biz" } }
+  ]
+}
+```
+
+### 4.2 Sub-Agent 机制（✅ 已验证）
+
+**OpenClaw 官方文档**（来源：docs.openclaw.ai/tools/subagents）：
+
+> "Sub-agents are background agent runs spawned from an existing agent run. They run in their own session (`agent:<agentId>:subagent:<uuid>`)"
+
+**嵌套深度**（已验证）：
+| 深度 | Session Key | 权限 |
+|------|-------------|------|
+| 0 | `agent:<id>:main` | 可 spawn |
+| 1 | `agent:<id>:subagent:<uuid>` | 可 spawn (maxSpawnDepth≥2) |
+| 2 | `agent:<id>:subagent:<uuid>:subagent:<uuid>` | 不可 spawn |
+
+**配置**（官方）：
+```json5
+{
+  agents: {
+    defaults: {
+      subagents: {
+        maxSpawnDepth: 2,
+        maxChildrenPerAgent: 5,
+        maxConcurrent: 8,
+        runTimeoutSeconds: 900
+      }
+    }
+  }
+}
+```
+
+**工具**（已验证）：
+- `sessions_spawn` - 启动子 Agent
+- `subagents` - 管理子 Agent（list/kill/steer）
+- `sessions_send` - 跨 Agent 消息
+
+### 4.3 Session 管理（✅ 已验证）
+
+**OpenClaw 官方文档**（来源：docs.openclaw.ai/concepts/session）：
+
+**DM 隔离选项**（已验证）：
+| 选项 | 描述 |
+|------|------|
+| `main` | 所有 DM 共享一个会话 |
+| `per-peer` | 按发送者隔离 |
+| `per-channel-peer` | 按渠道+发送者隔离（推荐） |
+| `per-account-channel-peer` | 按账号+渠道+发送者隔离 |
+
+**存储位置**（已验证）：
+> "Store: `~/.openclaw/agents/<agentId>/sessions/sessions.json`"
+> "Transcripts: `~/.openclaw/agents/<agentId>/sessions/<sessionId>.jsonl`"
+> — Source: docs.openclaw.ai/concepts/session
+
+---
+
+## 第五部分：Sandbox 详细技术对比
+
+### 5.1 DeerFlow Sandbox 架构
 
 ```python
 # DeerFlow 的 Sandbox 抽象层
@@ -123,676 +292,217 @@ class SandboxProvider(ABC):
         pass
     
     @abstractmethod
-    def get(self, thread_id: str) -> Sandbox | None:
-        """获取现有沙箱"""
-        pass
-    
-    @abstractmethod
     def release(self, thread_id: str) -> None:
         """释放沙箱资源"""
         pass
-
-class Sandbox(ABC):
-    @abstractmethod
-    def execute_command(self, cmd: str, timeout: int = 60) -> CommandResult:
-        """执行命令"""
-        pass
-    
-    @abstractmethod
-    def read_file(self, path: str) -> str:
-        """读取文件"""
-        pass
-    
-    @abstractmethod
-    def write_file(self, path: str, content: str) -> None:
-        """写入文件"""
-        pass
-    
-    @abstractmethod
-    def list_dir(self, path: str) -> list[FileInfo]:
-        """列出目录"""
-        pass
 ```
 
-**OpenClaw Sandbox 技术实现**：
-
-```python
-# OpenClaw 的 Sandbox 工具（直接调用）
-def execute(command: str, timeout: int = 60) -> CommandResult:
-    """在沙箱中执行命令"""
-    # 直接执行，无 Provider 抽象
-    pass
-
-def read(path: str) -> str:
-    """读取文件"""
-    pass
-
-def write(path: str, content: str) -> None:
-    """写入文件"""
-    pass
-```
-
-**技术差异分析**：
-
-1. **抽象程度**：DeerFlow 使用 Provider 模式，支持多种实现（Local/Docker/K8s）无缝切换；OpenClaw 直接工具调用，扩展性较弱
-2. **生命周期管理**：DeerFlow 显式管理 acquire/release，支持连接池和复用；OpenClaw 隐式管理，每次调用独立
-3. **测试友好性**：DeerFlow 的抽象层便于 mock 测试；OpenClaw 需要集成测试
-
-> 参考：~/wego/projects/deer-flow/docs/external/01_architecture_overview.md, OpenClaw 源码
-
----
-
-### 2. 隔离级别对比
-
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| Local 模式 | 单例，直接执行 | Host 执行 | 类似，都依赖宿主机 |
-| Docker 模式 | Docker 容器 | Docker 容器 | 相同实现 |
-| K8s 模式 | Provisioner + K8s Pod | 不支持 | DeerFlow 支持云原生 |
-| 进程隔离 | 可选（容器/本地） | 可选 | DeerFlow 选择更丰富 |
-
-**技术实现差异**：
-
-DeerFlow 的 `AioSandboxProvider` 使用 Docker SDK 管理容器：
-
-```python
-# DeerFlow Docker 实现
-class AioSandboxProvider(SandboxProvider):
-    def __init__(self, image: str, memory_limit: str = "512m"):
-        self.docker = aiodocker.Docker()
-        self.image = image
-        self.memory_limit = memory_limit
-    
-    async def acquire(self, thread_id: str) -> Sandbox:
-        # 检查现有容器
-        container = await self._get_container(thread_id)
-        if container:
-            return DockerSandbox(container)
-        
-        # 创建新容器
-        container = await self.docker.containers.create(
-            image=self.image,
-            name=f"deerflow-sandbox-{thread_id}",
-            host_config={
-                "Memory": self._parse_memory(self.memory_limit),
-                "Binds": self._get_volume_binds(thread_id)
-            }
-        )
-        await container.start()
-        return DockerSandbox(container)
-```
-
-OpenClaw 的 Sandbox 通过 `docker exec` 直接执行：
-
-```bash
-# OpenClaw 执行流程
-# 1. 启动固定容器（或复用现有）
-docker run -d --name openclaw-sandbox \
-  -v ~/.openclaw/workspace:/workspace \
-  openclaw-sandbox:latest
-
-# 2. 执行命令
-docker exec openclaw-sandbox bash -c "<command>"
-```
-
-**关键差异**：
-- DeerFlow 支持 **Provisioner 模式**，可以通过 Kubernetes 编排 Pod，实现大规模弹性伸缩
-- OpenClaw 仅支持单机 Docker，无云原生能力
-- DeerFlow 的 per-thread 容器隔离更彻底，OpenClaw 可能复用同一容器
-
-> 参考：~/wego/projects/deer-flow/docs/external/02_claude_developer_guide.md
-
----
-
-### 3. 路径映射对比
-
-**DeerFlow 虚拟路径映射**：
-
-```
-容器内路径                      → 宿主机路径
-/mnt/user-data/workspace/       → .deer-flow/threads/{id}/workspace/
-/mnt/user-data/uploads/         → .deer-flow/threads/{id}/uploads/
-/mnt/user-data/outputs/         → .deer-flow/threads/{id}/outputs/
-/mnt/skills/                    → skills/
-```
-
-**OpenClaw 路径映射**：
-
-```
-工作目录                        → 宿主机路径
-/workspace/                     → ~/.openclaw/workspace/
-/sandbox/                       → 临时目录或 Docker 卷
-```
-
-**技术差异分析**：
-
-| 特性 | DeerFlow | OpenClaw |
-|------|----------|----------|
-| 路径前缀 | `/mnt/user-data` 统一前缀 | `/workspace` 直接映射 |
-| 目录划分 | workspace/uploads/outputs 分离 | 统一 workspace |
-| 技能挂载 | `/mnt/skills` 独立挂载 | 通过 workspace 访问 |
-| 隔离粒度 | per-thread 目录隔离 | per-session 隔离 |
-
-DeerFlow 的路径设计优势：
-1. **语义清晰**：uploads/outputs/workspace 职责分离
-2. **安全隔离**：每个 thread 独立目录，防止跨会话数据泄露
-3. **技能共享**：skills 目录只读挂载，多个 thread 共享
-
-OpenClaw 的设计更简洁，适合单用户场景，但多用户场景下隔离性不足。
-
-> 参考：~/wego/projects/deer-flow/docs/external/01_architecture_overview.md
-
----
-
-### 4. 生命周期管理对比
-
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 创建时机 | Thread 开始时 | Session 开始时 | 相同 |
-| 复用策略 | per-thread 复用 | per-session 复用 | 相同 |
-| 销毁时机 | Thread 删除时 | Session 结束时 | 相同 |
-| 持久化 | 文件保留在宿主机 | 文件保留在宿主机 | 相同 |
-| 并发控制 | 双线程池调度 | 独立进程 | DeerFlow 更高效 |
-
-**技术实现差异**：
-
-DeerFlow 使用 `SandboxMiddleware` 在请求链中管理生命周期：
-
-```python
-# DeerFlow SandboxMiddleware
-class SandboxMiddleware:
-    async def before_agent(self, state: ThreadState, config: RunnableConfig):
-        # 获取或创建沙箱
-        provider = get_sandbox_provider()
-        sandbox = await provider.acquire(state.thread_id)
-        state.sandbox = {"sandbox_id": sandbox.id}
-        return state
-    
-    async def after_agent(self, state: ThreadState, config: RunnableConfig):
-        # 可选：释放或保留沙箱
-        if config.get("release_sandbox"):
-            provider = get_sandbox_provider()
-            await provider.release(state.thread_id)
-        return state
-```
-
-OpenClaw 使用 `sessions_spawn` 创建独立进程：
-
-```python
-# OpenClaw 会话管理
-sessions_spawn(
-    task="...",
-    runtime="subagent",
-    timeoutSeconds=0  # 无限制
-)
-
-# Sandbox 在 session 进程中隐式管理
-# 进程结束 = session 结束 = sandbox 释放
-```
-
-**关键差异**：
-- DeerFlow 的 Sub-Agent 最大并发 **3 个**（硬编码），通过双线程池调度
-- OpenClaw 无明确并发限制，依赖系统资源
-- DeerFlow 支持细粒度的资源控制（内存限制、CPU 限制）
-
-> 参考：~/wego/projects/deer-flow/docs/external/zread_09_lead_agent_middleware.md
-
----
-
-## 第三部分：Sub-Agent 对比
-
-### 1. 调度机制对比
-
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 调度方式 | 双线程池（scheduler+execution） | 独立进程 | DeerFlow 更轻量 |
-| 最大并发 | 3 个（硬编码） | 无明确限制 | DeerFlow 限制更严格 |
-| 超时控制 | 15 分钟 | 可配置 | DeerFlow 固定超时 |
-| 通信方式 | SSE 事件流 | 消息传递 | DeerFlow 实时性更好 |
-
-**DeerFlow Sub-Agent 技术实现**：
-
-```python
-class SubagentExecutor:
-    # 双线程池设计
-    _scheduler_pool = ThreadPoolExecutor(max_workers=3)   # 调度线程池
-    _execution_pool = ThreadPoolExecutor(max_workers=3)   # 执行线程池
-    
-    MAX_CONCURRENT_SUBAGENTS = 3  # 最大并发限制
-    TIMEOUT_SECONDS = 900         # 15分钟超时
-    
-    async def execute(self, task: str, parent_state: ThreadState) -> Result:
-        # 1. 提交到调度池
-        future = self._scheduler_pool.submit(
-            self._run_subagent, task, parent_state
-        )
-        
-        # 2. 调度器提交到执行池
-        # 3. 每 5 秒轮询进度
-        # 4. 通过 SSE 推送事件
-        
-    def _run_subagent(self, task: str, parent_state: ThreadState):
-        # 在 _execution_pool 中执行
-        # 创建新的 ThreadState，继承部分上下文
-        subagent_state = self._create_subagent_state(parent_state)
-        result = run_agent(task, subagent_state)
-        return result
-```
-
-**OpenClaw Sub-Agent 技术实现**：
-
-```python
-# OpenClaw 使用 sessions_spawn
-sessions_spawn(
-    task="...",
-    runtime="subagent",
-    timeoutSeconds=0  # 无限制
-)
-
-# 内部实现：创建独立进程/容器
-# 通过消息队列通信
-# 无内置并发限制
-```
-
-**技术差异分析**：
-
-1. **资源开销**：DeerFlow 的线程池模型开销更低；OpenClaw 的独立进程模型隔离性更好
-2. **并发控制**：DeerFlow 硬编码 3 个并发，防止资源耗尽；OpenClaw 依赖外部资源管理
-3. **实时反馈**：DeerFlow 的 SSE 流式推送用户体验更好；OpenClaw 的消息传递有延迟
-
-> 参考：~/wego/projects/deer-flow/docs/external/zread_09_lead_agent_middleware.md, OpenClaw 文档
-
----
-
-### 2. 上下文隔离对比
-
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 上下文传递 | ThreadState 继承 | Session 参数传递 | DeerFlow 自动继承 |
-| 工具继承 | 子集继承 | 完全独立 | DeerFlow 更灵活 |
-| 状态共享 | 共享 ThreadState | 独立状态 | DeerFlow 共享更多 |
-
-**DeerFlow 上下文传递**：
-
-```python
-# 子代理继承父代理的 ThreadState
-def _create_subagent_state(parent_state: ThreadState) -> ThreadState:
-    return ThreadState(
-        messages=[],  # 新对话历史
-        sandbox=parent_state.sandbox,  # 共享沙箱
-        thread_data=parent_state.thread_data,  # 共享路径
-        # 其他字段选择性继承
-    )
-```
-
-**OpenClaw 上下文传递**：
-
-```python
-# 通过参数显式传递
-sessions_spawn(
-    task="...",
-    runtime="subagent",
-    # 上下文通过参数传递，无自动继承
-)
-```
-
-> 参考：~/wego/projects/deer-flow/docs/external/01_architecture_overview.md
-
----
-
-## 第四部分：Memory 系统对比
-
-### 1. 存储机制对比
-
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 存储格式 | JSON 文件 | Markdown 文件 | DeerFlow 结构化，OpenClaw 可读性更好 |
-| 存储位置 | .deer-flow/memory.json | MEMORY.md + memory/*.md | DeerFlow 集中，OpenClaw 分散 |
-| 更新机制 | 异步队列 + 防抖 | 实时写入 | DeerFlow 性能更好 |
-
-**DeerFlow Memory 技术实现**：
-
-```python
-# 异步更新队列
-memory_queue = deque()
-DEBOUNCE_SECONDS = 30  # 30秒防抖
-
-class MemoryUpdater:
-    async def update_memory(self, conversation: list[Message]):
-        # 1. 加入队列
-        memory_queue.append(conversation)
-        
-        # 2. 防抖等待
-        await asyncio.sleep(DEBOUNCE_SECONDS)
-        
-        # 3. LLM 提取事实
-        facts = await llm_extract_facts(conversation)
-        
-        # 4. 原子写入 JSON
-        temp_file = f"{MEMORY_PATH}.tmp"
-        json.dump(memory_data, temp_file)
-        os.rename(temp_file, MEMORY_PATH)
-
-# 存储结构
+### 5.2 OpenClaw Sandbox（✅ 已验证）
+
+**官方文档**（来源：docs.openclaw.ai/gateway/sandboxing）：
+
+**沙箱模式**（已验证）：
+| 模式 | 描述 |
+|------|------|
+| `off` | 无沙箱 |
+| `non-main` | 仅非主会话使用沙箱（默认） |
+| `all` | 所有会话使用沙箱 |
+
+**作用域**（已验证）：
+| 作用域 | 描述 |
+|--------|------|
+| `session` | 每个会话一个容器（默认） |
+| `agent` | 每个 Agent 一个容器 |
+| `shared` | 所有会话共享一个容器 |
+
+**后端**（已验证）：
+| 后端 | 描述 |
+|------|------|
+| `docker` | 本地 Docker（默认） |
+| `ssh` | 远程 SSH |
+| `openshell` | OpenShell 托管 |
+
+**配置示例**（官方）：
+```json5
 {
-    "user": {
-        "workContext": {"summary": "...", "updatedAt": "..."},
-        "personalContext": {"summary": "...", "updatedAt": "..."}
-    },
-    "facts": [
-        {
-            "id": "uuid",
-            "content": "事实内容",
-            "category": "preference|knowledge|...",
-            "confidence": 0.85,
-            "createdAt": "..."
-        }
-    ]
+  agents: {
+    defaults: {
+      sandbox: {
+        mode: "non-main",
+        scope: "session",
+        workspaceAccess: "none",
+        backend: "docker"
+      }
+    }
+  }
 }
 ```
 
-**OpenClaw Memory 技术实现**：
-
-```python
-# 直接写入 Markdown
-write("memory/2024-01-15.md", content)
-write("MEMORY.md", summary)
-
-# 语义搜索
-memory_search(query="...")  # 基于向量的语义检索
-```
-
-**技术差异分析**：
-
-1. **写入性能**：DeerFlow 的异步队列 + 防抖减少 I/O 次数；OpenClaw 实时写入简单直接
-2. **数据结构**：DeerFlow 的 JSON 结构化便于程序处理；OpenClaw 的 Markdown 人工可读
-3. **扩展性**：DeerFlow 支持置信度、分类等元数据；OpenClaw 依赖语义搜索
-
-> 参考：~/wego/projects/deer-flow/docs/external/04_memory_system.md
+**工作区访问**（已验证）：
+| 选项 | 描述 |
+|------|------|
+| `none` | 沙箱独立工作区 |
+| `ro` | 只读挂载 Agent 工作区 |
+| `rw` | 读写挂载 Agent 工作区 |
 
 ---
 
-### 2. 检索机制对比
+## 第六部分：Skills 系统对比
 
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 检索方式 | 置信度排序 | 语义搜索 | DeerFlow 简单，OpenClaw 更智能 |
-| 注入方式 | Top 15 facts + context | 相关片段 | DeerFlow 固定数量，OpenClaw 动态 |
-| Token 控制 | max_injection_tokens | 无明确限制 | DeerFlow 更精细 |
+### 6.1 OpenClaw Skills（✅ 已验证）
 
-**DeerFlow 检索实现**：
+**官方文档**（来源：docs.openclaw.ai/tools/skills）：
 
-```python
-def format_memory_for_injection(
-    memory_data: dict,
-    max_tokens: int = 2000
-) -> str:
-    # 1. 按置信度排序 facts
-    sorted_facts = sorted(
-        memory_data["facts"],
-        key=lambda x: x["confidence"],
-        reverse=True
-    )
-    
-    # 2. 取 Top 15
-    top_facts = sorted_facts[:15]
-    
-    # 3. 按 token 预算截断
-    result = []
-    current_tokens = 0
-    for fact in top_facts:
-        fact_tokens = count_tokens(fact["content"])
-        if current_tokens + fact_tokens > max_tokens:
-            break
-        result.append(fact)
-        current_tokens += fact_tokens
-    
-    return format_memory_xml(result)
+**加载优先级**（从高到低，已验证）：
+```
+1. <workspace>/skills/                    (最高)
+2. <workspace>/.agents/skills/
+3. ~/.agents/skills/
+4. ~/.openclaw/skills/
+5. Bundled skills (随安装包)
+6. skills.load.extraDirs/Plugin skills     (最低)
 ```
 
-**OpenClaw 检索实现**：
-
-```python
-# 语义搜索
-memory_search(query="用户偏好什么编程语言？")
-# 返回语义相关的片段，无固定数量限制
+**格式**（AgentSkills 兼容，已验证）：
+```markdown
+---
+name: image-lab
+description: Generate or edit images
+metadata:
+  {
+    "openclaw": {
+      "requires": { "bins": ["uv"], "env": ["GEMINI_API_KEY"] },
+      "primaryEnv": "GEMINI_API_KEY"
+    }
+  }
+---
 ```
 
-**关键差异**：
-- DeerFlow 使用 **置信度 + Token 预算** 的确定性策略
-- OpenClaw 使用 **语义相似度** 的模糊匹配策略
-- DeerFlow 更适合精确控制，OpenClaw 更适合灵活检索
+### 6.2 ClawHub 技能市场（✅ 已验证）
 
-> 参考：~/wego/projects/deer-flow/docs/external/04_memory_system.md, OpenClaw 文档
+**官方文档**（来源：docs.openclaw.ai/tools/skills）：
+
+> "ClawHub is the public skills registry for OpenClaw. Browse at https://clawhub.com"
+
+**CLI 命令**（已验证）：
+```bash
+openclaw skills install <skill-slug>
+openclaw skills update --all
+```
 
 ---
 
-## 第五部分：Skills 系统对比
+## 第七部分：Nodes 节点系统对比
 
-### 1. 加载机制对比
+### 7.1 OpenClaw Nodes（✅ 已验证）
 
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 加载时机 | 渐进加载（按需） | 启动加载（全量） | DeerFlow 省 token |
-| 加载方式 | 运行时读取 Markdown | 启动时解析 | DeerFlow 更灵活 |
-| 更新方式 | 动态启用/禁用 | 重启生效 | DeerFlow 更友好 |
+**官方文档**（来源：docs.openclaw.ai/nodes）：
 
-**DeerFlow Skills 技术实现**：
+> "A **node** is a companion device (macOS/iOS/Android/headless) that connects to the Gateway **WebSocket** with `role: "node"`"
 
-```python
-# 按需加载
-def load_skill_on_demand(skill_name: str) -> str:
-    skill_path = f"skills/public/{skill_name}/SKILL.md"
-    skill_content = read_file(skill_path)
-    
-    # 解析 YAML frontmatter
-    metadata, content = parse_frontmatter(skill_content)
-    
-    # 注入到系统提示
-    if task_requires_skill(skill_name):
-        inject_to_prompt(content)
+**支持的 Node 平台**（已验证）：
+| 平台 | 功能 |
+|------|------|
+| iOS | Canvas、Camera、Location、Talk Mode、Voice Wake |
+| Android | Canvas、Camera、Screen Recording、SMS、Notifications |
+| macOS | Canvas、Camera、Screen Recording、System Commands |
+| Headless | System Commands |
 
-# 渐进加载示例
-# 系统有 20 个技能，每个 500 tokens
-# 全量加载：20 * 500 = 10000 tokens
-# 渐进加载：只用 1 个技能 → 500 tokens（节省 95%）
-```
+**Node 命令**（已验证）：
+| 命令族 | 功能 |
+|--------|------|
+| `canvas.*` | Canvas 控制、导航、截图 |
+| `camera.*` | 拍照、录像 |
+| `screen.record` | 屏幕录制 |
+| `location.get` | 获取位置 |
+| `system.run` | 远程执行命令 |
+| `notifications.*` | 通知管理 |
 
-**OpenClaw Skills 技术实现**：
+### 7.2 iOS App 功能（✅ 已验证）
 
-```python
-# 启动时全量加载
-available_skills = []
-for skill_dir in skills/:
-    skill = parse_skill(skill_dir / "SKILL.md")
-    available_skills.append(skill)
+**官方文档**（来源：docs.openclaw.ai/platforms/ios）：
 
-# 所有技能在启动时解析并缓存
-# 更新技能需要重启
-```
-
-**技术差异分析**：
-
-1. **Token 效率**：DeerFlow 的渐进加载显著减少 prompt tokens；OpenClaw 全量加载消耗更多 tokens
-2. **灵活性**：DeerFlow 支持运行时动态启用/禁用；OpenClaw 需要重启
-3. **延迟**：DeerFlow 首次使用技能有读取延迟；OpenClaw 启动后无延迟
-
-> 参考：~/wego/projects/deer-flow/docs/external/02_claude_developer_guide.md, OpenClaw 文档
+| 功能 | 状态 |
+|------|------|
+| Canvas | ✅ |
+| Screen Snapshot | ✅ |
+| Camera Capture | ✅ |
+| Location | ✅ |
+| Talk Mode | ✅ |
+| Voice Wake | ✅ |
 
 ---
 
-## 第六部分：Middleware 对比
+## 第八部分：验证结论
 
-### 1. 架构设计对比
+### 8.1 OpenClaw 验证状态汇总
 
-| 维度 | DeerFlow | OpenClaw | 技术差异 |
-|------|----------|----------|---------|
-| 中间件数量 | 16 个 | 较少 | DeerFlow 更完善 |
-| 执行顺序 | 严格链式 | 简单顺序 | DeerFlow 更复杂 |
-| Hook 点 | 5 个生命周期 | 较少 | DeerFlow 更精细 |
-| 条件执行 | 支持条件中间件 | 简单条件 | DeerFlow 更灵活 |
+| 章节 | 验证状态 | 官方来源 |
+|------|---------|---------|
+| Gateway 架构 | ✅ 已验证 | docs.openclaw.ai/concepts/architecture |
+| WebSocket 协议 | ✅ 已验证 | docs.openclaw.ai/concepts/architecture |
+| HTTP API | ✅ 已验证 | docs.openclaw.ai/gateway |
+| Channel 支持（20+） | ✅ 已验证 | docs.openclaw.ai/channels |
+| Web 端（Control UI/WebChat） | ✅ 已验证 | docs.openclaw.ai/web |
+| Cron 自动化 | ✅ 已验证 | docs.openclaw.ai/automation/cron-jobs |
+| Webhook 触发器 | ✅ 已验证 | docs.openclaw.ai/automation/webhook |
+| Heartbeat | ✅ 已验证 | docs.openclaw.ai/gateway/heartbeat |
+| Multi-Agent | ✅ 已验证 | docs.openclaw.ai/concepts/multi-agent |
+| Sub-Agent | ✅ 已验证 | docs.openclaw.ai/tools/subagents |
+| Session 管理 | ✅ 已验证 | docs.openclaw.ai/concepts/session |
+| Skills 系统 | ✅ 已验证 | docs.openclaw.ai/tools/skills |
+| ClawHub | ✅ 已验证 | docs.openclaw.ai/tools/skills |
+| 沙箱系统 | ✅ 已验证 | docs.openclaw.ai/gateway/sandboxing |
+| Nodes 系统 | ✅ 已验证 | docs.openclaw.ai/nodes |
+| iOS App | ✅ 已验证 | docs.openclaw.ai/platforms/ios |
 
-**DeerFlow Middleware Hook 点**：
+### 8.2 需要修正的内容
 
-```python
-# 5 个生命周期 Hook
-class Middleware:
-    async def before_agent(self, state, config):
-        """Agent 执行前"""
-        pass
-    
-    async def wrap_model_call(self, call, state, config):
-        """模型调用包装"""
-        return await call(state, config)
-    
-    async def before_model(self, state, config):
-        """模型调用前"""
-        pass
-    
-    async def after_model(self, state, config, response):
-        """模型调用后"""
-        pass
-    
-    async def wrap_tool_call(self, call, state, config):
-        """工具调用包装"""
-        return await call(state, config)
-    
-    async def after_agent(self, state, config):
-        """Agent 执行后"""
-        pass
-```
+| 原内容 | 修正 |
+|--------|------|
+| MCP 支持 | ⚠️ **未找到官方 MCP 文档**，仅发现 `openclaw mcp` CLI 命令 |
+| Web 端描述 | OpenClaw 有 WebChat 和 Control UI，但需要 Gateway 运行 |
 
-**DeerFlow 中间件链（16个）**：
+### 8.3 综合对比表
 
-| 顺序 | 中间件 | Hook | 作用 |
-|------|--------|------|------|
-| 1 | ThreadDataMiddleware | before_agent | 创建 per-thread 目录 |
-| 2 | UploadsMiddleware | before_agent | 处理上传文件 |
-| 3 | SandboxMiddleware | before_agent | 获取沙箱 |
-| 4 | DanglingToolCallMiddleware | wrap_model_call | 修复工具调用 |
-| 5 | GuardrailMiddleware | wrap | 安全检查 |
-| 6 | SummarizationMiddleware | before_agent | 上下文摘要 |
-| 7 | TodoListMiddleware | before_model | 计划模式 |
-| 8 | TitleMiddleware | after_model | 自动生成标题 |
-| 9 | MemoryMiddleware | after_agent | 记忆更新 |
-| 10 | ViewImageMiddleware | before_model | 视觉模型 |
-| 11 | SubagentLimitMiddleware | after_model | 子代理限制 |
-| 12 | LoopDetectionMiddleware | after_model | 循环检测 |
-| 13 | ClarificationMiddleware | wrap_tool_call | 澄清处理 |
-| 14 | TokenUsageMiddleware | after_model | Token 记录 |
-| 15 | ToolErrorHandlingMiddleware | wrap_tool_call | 错误处理 |
-| 16 | DeferredToolFilterMiddleware | wrap_model_call | 延迟工具过滤 |
-
-> 参考：~/wego/projects/deer-flow/docs/external/zread_09_lead_agent_middleware.md
-
----
-
-## 第七部分：外部资料搜索
-
-由于网络搜索工具暂时不可用，以下分析基于已有文档和公开信息：
-
-### 1. 社区对 DeerFlow vs OpenClaw 的对比评价
-
-根据开发者社区反馈（参考 ~/wego/projects/deer-flow/docs/external/12_dev_community_analysis.md）：
-
-**DeerFlow 优势**：
-- 开箱即用，配置简单
-- 基于 LangGraph，生态丰富
-- 支持 Kubernetes，适合企业部署
-- 沙箱隔离完善
-
-**OpenClaw 优势**：
-- 架构简洁，易于理解
-- 自研框架，无外部依赖
-- 适合深度定制
-- 轻量级部署
-
-### 2. Sandbox 实现的技术讨论
-
-**DeerFlow 的 Sandbox 设计获得好评**：
-- Provider 模式便于扩展
-- 支持 Local/Docker/K8s 三种模式
-- per-thread 隔离确保安全
-
-**OpenClaw 的 Sandbox 相对简单**：
-- 直接工具调用，学习成本低
-- 适合单机使用
-- 云原生支持有限
-
-### 3. Agent 框架选型讨论
-
-**LangGraph vs 自研框架**：
-- LangGraph 提供成熟的图结构工作流，适合复杂场景
-- 自研框架更灵活，但需要自行解决状态管理、checkpointing 等问题
-
-> 参考：~/wego/projects/deer-flow/docs/external/12_dev_community_analysis.md
-
----
-
-## 第八部分：总结和建议
-
-### 1. 选型建议
-
-| 场景 | 推荐 | 原因 |
-|------|------|------|
-| 快速启动 | DeerFlow | 开箱即用，配置简单 |
-| 深度定制 | OpenClaw | 自研架构，更灵活 |
-| 多用户 | DeerFlow + 扩展 | 需要自行实现用户层 |
-| 云原生 | DeerFlow | 支持 K8s |
-| 轻量级 | OpenClaw | 依赖更少 |
-| 企业部署 | DeerFlow | 完善的隔离和监控 |
-| 个人使用 | 均可 | 根据技术栈偏好选择 |
-
-### 2. OpenClaw 可借鉴的 DeerFlow 设计
-
-1. **Middleware 链设计模式**
-   - 参考 DeerFlow 的 5 个 Hook 点设计
-   - 实现条件中间件支持
-
-2. **渐进式 Skill 加载**
-   - 按需加载减少 token 消耗
-   - 运行时动态启用/禁用
-
-3. **Sub-Agent 并发控制**
-   - 引入最大并发限制
-   - 双线程池调度模型
-
-4. **虚拟路径映射**
-   - 统一路径前缀
-   - workspace/uploads/outputs 职责分离
-
-### 3. DeerFlow 可改进的点
-
-1. **内置用户管理系统**
-   - 当前为单用户系统
-   - 建议增加可选的多用户支持
-
-2. **Memory 语义搜索**
-   - 当前仅支持置信度排序
-   - 建议增加 TF-IDF/向量检索
-
-3. **更灵活的 Sub-Agent 配置**
-   - 当前最大并发硬编码为 3
-   - 建议支持运行时配置
-
-4. **OpenClaw 兼容性层**
-   - 支持 OpenClaw 的 Skill 格式
-   - 便于生态互通
+| 维度 | DeerFlow | OpenClaw |
+|------|----------|----------|
+| **架构** | Harness/App 分层 | **Gateway 中心化** |
+| **协议** | HTTP REST | **WebSocket + HTTP** |
+| **渠道** | 有限 | **20+ 种** |
+| **Web 端** | ✅ 主打 | ✅ Control UI + WebChat |
+| **移动端** | ❌ | **✅ iOS/Android** |
+| **桌面端** | ❌ | **✅ macOS** |
+| **自动化** | ❌ 被动式 | **✅ Cron + Webhook + Heartbeat** |
+| **Multi-Agent** | 未知 | **✅ 原生支持** |
+| **Sub-Agent** | 未知 | **✅ 支持嵌套** |
+| **沙箱** | Provider 模式 | **Docker/SSH/OpenShell** |
+| **Skills** | 未知 | **✅ ClawHub 生态** |
+| **Nodes** | ❌ | **✅ iOS/Android/macOS** |
 
 ---
 
 ## 参考资料
 
-1. ~/wego/projects/deer-flow/docs/external/01_architecture_overview.md
-2. ~/wego/projects/deer-flow/docs/external/02_claude_developer_guide.md
-3. ~/wego/projects/deer-flow/docs/external/04_memory_system.md
-4. ~/wego/projects/deer-flow/docs/external/zread_09_lead_agent_middleware.md
-5. ~/wego/projects/deer-flow/docs/inspect_structure_overview.md
-6. ~/wego/projects/deer-flow/docs/inspect_structure_sandbox_tools.md
-7. ~/wego/projects/deer-flow/docs/inspect_structure_gateway_agent.md
-8. OpenClaw 官方文档与源码
+### OpenClaw 官方文档（已验证）
+1. docs.openclaw.ai/concepts/architecture - Gateway 架构
+2. docs.openclaw.ai/gateway - Gateway 运行手册
+3. docs.openclaw.ai/channels - 渠道支持
+4. docs.openclaw.ai/automation/cron-jobs - Cron 自动化
+5. docs.openclaw.ai/automation/webhook - Webhook
+6. docs.openclaw.ai/concepts/multi-agent - Multi-Agent
+7. docs.openclaw.ai/tools/subagents - Sub-Agent
+8. docs.openclaw.ai/concepts/session - Session 管理
+9. docs.openclaw.ai/tools/skills - Skills 系统
+10. docs.openclaw.ai/gateway/sandboxing - 沙箱系统
+11. docs.openclaw.ai/nodes - Nodes 系统
+12. docs.openclaw.ai/platforms/ios - iOS App
+
+### DeerFlow 资料
+- 基于用户提供的大纲和内部文档
 
 ---
 
-*文档生成时间：2026-03-29*  
+*文档生成时间：2026-03-30*  
+*验证状态：OpenClaw 内容全部来自官方文档（docs.openclaw.ai）*  
 *分析工具：Senior Tech Architect Engineer Agent*
